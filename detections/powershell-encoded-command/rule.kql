@@ -1,0 +1,66 @@
+// =============================================================================
+// Detecting PowerShell encoded-command execution
+// MITRE ATT&CK: T1059.001 (Command and Scripting Interpreter: PowerShell)
+// Primary stack: Microsoft Defender for Endpoint / Sentinel — DeviceProcessEvents
+// =============================================================================
+//
+// BEHAVIOR
+// Adversaries pass a Base64-encoded script to PowerShell via -EncodedCommand so
+// the actual payload never appears as readable text on the command line. It
+// defeats casual eyeballing and naive string-match rules, and is the default
+// output of many offensive frameworks (Empire, Cobalt Strike's powershell
+// stager, msfvenom's psh-cmd).
+//
+// THE PARSING QUIRK THAT MOST RULES MISS
+// PowerShell resolves parameters by unambiguous *prefix* and is case-insensitive,
+// and accepts '/' as well as '-' for the switch character. So all of these mean
+// -EncodedCommand:  -EncodedCommand  -encodedcommand  -enc  -en  -e  /e  /enc
+// A rule that greps for "-encodedcommand" or even "-enc" misses "-e"/"-ec",
+// which is precisely what operators who know the quirk (and some tooling) use.
+// -> The switch alone is a weak anchor. See dead-end note in README.
+//
+// THE DISCRIMINATOR
+// The reliable signal is the *shape of the argument*: a long Base64 blob. A tiny
+// PowerShell command Base64-encodes to well over 20 chars (UTF-16LE + Base64
+// roughly triples length), so a >=20-char [A-Za-z0-9+/=] run after an -e* switch
+// is the thing to key on. This also separates -EncodedCommand from its lookalike
+// sibling -ExecutionPolicy: '-e' is a valid prefix of both, but -ExecutionPolicy
+// is followed by "Bypass"/"Unrestricted"/"RemoteSigned" (<=12 chars), not a blob.
+//
+// -----------------------------------------------------------------------------
+
+let powershell_names = dynamic(["powershell.exe", "pwsh.exe", "powershell_ise.exe"]);
+DeviceProcessEvents
+// Catch PowerShell by image name, and also when it is launched via a full path
+// or a renamed copy where the real name still shows in the command line.
+| where FileName in~ (powershell_names)
+    or ProcessCommandLine matches regex @"(?i)\b(powershell|pwsh)(\.exe)?\b"
+// The switch: '-' or '/', then 'e' plus any prefix of "ncodedcommand" (0+ letters),
+// then whitespace, then a Base64-shaped run of >=20 chars.
+// {20,} is the tuning knob: lower = catch shorter payloads but more FP from
+// -ExecutionPolicy and other -e* switches; raise if benign encoded blobs are short.
+| where ProcessCommandLine matches regex @"(?i)[\s""']?[-/]e[a-z]*\s+[A-Za-z0-9+/=]{20,}"
+| project
+    Timestamp,
+    DeviceName,
+    AccountName,
+    FileName,
+    InitiatingProcessFileName,   // who spawned it — winword.exe/wscript.exe = suspicious
+    InitiatingProcessCommandLine,
+    ProcessCommandLine
+| sort by Timestamp desc
+
+// -----------------------------------------------------------------------------
+// TUNING KNOBS (justified so future-me and reviewers can see the trade-offs):
+//   * {20,}         — minimum Base64 length. See above.
+//   * powershell_names / regex — drop the regex clause if renamed-binary coverage
+//                     is not needed and FP from the word "powershell" in unrelated
+//                     command lines becomes a problem.
+//   * InitiatingProcessFileName — not filtered here on purpose; it is projected so
+//                     the analyst can triage by parent. A stricter variant could
+//                     filter to Office/script-host/browser parents to cut FP hard.
+// KNOWN GAPS (honest): does not decode the blob (a decode+re-scan for IEX /
+//   DownloadString / FromBase64String is a planned enrichment, not in this rule),
+//   and does not cover encoded commands piped via stdin or -Command with an inline
+//   [Convert]::FromBase64String. Those are separate detections.
+// -----------------------------------------------------------------------------
